@@ -32,6 +32,89 @@ char *server_proxy_hostname;
 int server_proxy_port;
 
 
+void send_info_message(int fd, const char* message){
+  char message_template[4096];
+
+  http_start_response(fd, 200);
+  http_send_header(fd, "Content-Type", "text/html");
+  http_end_headers(fd);
+  sprintf(message_template, "<center>"
+                            "<h1>Welcome to httpserver!</h1>"
+                            "<hr>"
+                            "<p>%s.</p>"
+                            "</center>", message);
+  http_send_string(fd, message_template);
+}
+
+
+void send_not_found(int fd, const char* requested_file){
+  char message_template[4096];
+
+  http_start_response(fd, 404);
+  http_send_header(fd, "Content-Type", "text/html");
+  http_end_headers(fd);
+  sprintf(message_template, "<center>"
+                            "<h1>Welcome to httpserver!</h1>"
+                            "<hr>"
+                            "<p>Sorry, %s can not be found.</p>"
+                            "</center>", requested_file);
+  http_send_string(fd, message_template); 
+}
+
+void list_directory(int fd, const char* dir_name){
+  DIR* cur_dir = opendir(dir_name);
+  struct dirent* dir_entry = readdir(cur_dir);
+
+  http_start_response(fd, 200);
+  http_send_header(fd, "Content-Type", "text/html");
+  http_end_headers(fd);
+
+  while(dir_entry != NULL){
+    char href_template[4096];
+
+    sprintf(href_template, "<a href=%s>%s</a>\n", dir_entry->d_name, dir_entry->d_name);
+    
+    http_send_string(fd, href_template);
+    dir_entry = readdir(cur_dir);
+  }
+
+  closedir(cur_dir);
+}
+
+void send_file(int fd, int requested_fd, const char* requested_file_name){
+  char buffer[4096];
+  ssize_t bytes_read;
+
+  http_start_response(fd, 200);
+  char length[1024];
+  sprintf(length, "%d", (int)lseek(requested_fd, 0, SEEK_END));
+  lseek(requested_fd, 0, SEEK_SET);
+  http_send_header(fd, "Content-Type", http_get_mime_type((char*)requested_file_name));
+  http_send_header(fd, "Content-Length", length);
+  http_end_headers(fd);
+
+  bytes_read = read(requested_fd, buffer, 4096);
+  while(bytes_read > 0){
+    http_send_data(fd, buffer, bytes_read);
+    bytes_read = read(requested_fd, buffer, 4096);
+  }
+  
+  close(requested_fd);
+}
+
+
+int is_a_directory(const char* path){
+  struct stat path_stat;
+  stat(path, &path_stat);
+  return S_ISDIR(path_stat.st_mode);
+}
+
+int is_a_file(const char* path){
+  struct stat path_stat;
+  stat(path, &path_stat);
+  return S_ISREG(path_stat.st_mode);
+}
+
 /*
  * Reads an HTTP request from stream (fd), and writes an HTTP response
  * containing:
@@ -44,25 +127,99 @@ int server_proxy_port;
  *   4) Send a 404 Not Found response.
  */
 void handle_files_request(int fd) {
-
-  /*
-   * TODO: Your solution for Task 1 goes here! Feel free to delete/modify *
-   * any existing code.
-   */
+  int requested_fd;
 
   struct http_request *request = http_request_parse(fd);
+  if(request == NULL) {
+    close(fd);
+    return;
+  }
 
-  http_start_response(fd, 200);
-  http_send_header(fd, "Content-Type", "text/html");
-  http_end_headers(fd);
-  http_send_string(fd,
-      "<center>"
-      "<h1>Welcome to httpserver!</h1>"
-      "<hr>"
-      "<p>Nothing's here yet.</p>"
-      "</center>");
+  if(strcmp(request->method, "GET") != 0){
+    send_info_message(fd, "Currently only GET method is supported");
+    close(fd);
+    return;
+  }
+
+  char requested_path[strlen(server_files_directory) + strlen(request->path) + 1];
+  strcpy(requested_path, server_files_directory);
+  strcat(requested_path, request->path);
+  
+  if(is_a_directory((const char*)requested_path)){
+    strcat(requested_path, "index.html");
+    requested_fd = open(requested_path, O_RDONLY);
+    if (requested_fd == -1){
+      requested_path[strlen(requested_path) - strlen("index.html")] = '\0';
+
+      strcat(requested_path, "/");
+      list_directory(fd, requested_path);
+
+      close(fd);
+      return;
+    }
+    send_file(fd, requested_fd, requested_path);
+  }else if (is_a_file(requested_path)){
+    requested_fd = open(requested_path, O_RDONLY);
+    if(requested_fd == -1){
+      send_not_found(fd, request->path);
+      close(fd);
+      return;
+    }
+    send_file(fd, requested_fd, requested_path);
+  }else{
+    send_not_found(fd, request->path);
+    close(fd);
+    return;
+  }
+
+  close(fd);
 }
 
+int ends_with(const char* c1, const char* c2, int length1, int length2){
+  if(length1 < length2) return 0;
+  for(int i = 1; i <= length2; i++){
+    if(c1[length1 - i] != c2[length2 - i]){
+      return 0;
+    }
+  }
+  return 1;
+}
+
+void* proxy_worker(void* aux){
+  int from = *(int*)aux;
+  int to = *((int*)aux + 1);
+
+  char buffer[(1 << 16)];
+  int bytes_read = read(from, buffer, (1 << 16));
+  while(bytes_read > 0){
+    int offset = 0;
+    int bytes_written = write(to, buffer, bytes_read);
+    if(bytes_written < 0){
+      close(from);
+      free(aux);
+
+      return NULL;
+    }
+    offset += bytes_written;
+    while(offset < bytes_read){
+      bytes_written = write(to, buffer + offset, bytes_read - offset + 1);
+      if(bytes_written < 0){
+        close(from);
+        free(aux);
+
+        return NULL;
+      }
+      offset += bytes_written; 
+    }
+
+    bytes_read = read(from, buffer, (1 << 16));          
+  }
+
+  close(from);
+  free(aux);
+
+  return NULL;
+}
 
 /*
  * Opens a connection to the proxy target (hostname=server_proxy_hostname and
@@ -117,10 +274,30 @@ void handle_proxy_request(int fd) {
     return;
 
   }
-
   /* 
   * TODO: Your solution for task 3 belongs here! 
   */
+  pthread_t* thread_a = malloc(sizeof(pthread_t));
+  pthread_t* thread_b = malloc(sizeof(pthread_t));
+  int* a_to_b = malloc(sizeof(int) * 2);
+  int* b_to_a = malloc(sizeof(int) * 2);
+  a_to_b[0] = fd;
+  b_to_a[0] = client_socket_fd;
+  a_to_b[1] = client_socket_fd;
+  b_to_a[1] = fd;
+  pthread_create(thread_a, NULL, proxy_worker, a_to_b);
+  pthread_create(thread_b, NULL, proxy_worker, b_to_a);
+}
+
+void* worker_routine(void* aux){
+    void(*request_handler)(int) = aux;
+
+    while(1){
+      int client_socket_number  = wq_pop(&work_queue);
+      request_handler(client_socket_number);
+    }
+    
+    return NULL;
 }
 
 
@@ -128,6 +305,10 @@ void init_thread_pool(int num_threads, void (*request_handler)(int)) {
   /*
    * TODO: Part of your solution for Task 2 goes here!
    */
+  for(int i = 0; i < num_threads; i++){
+    pthread_t* thread = malloc(sizeof(pthread_t));
+    pthread_create(thread, NULL, worker_routine, request_handler);
+  }
 }
 
 /*
@@ -188,8 +369,7 @@ void serve_forever(int *socket_number, void (*request_handler)(int)) {
         client_address.sin_port);
 
     // TODO: Change me?
-    request_handler(client_socket_number);
-    close(client_socket_number);
+    wq_push(&work_queue, client_socket_number);
 
     printf("Accepted connection from %s on port %d\n",
         inet_ntoa(client_address.sin_addr),
@@ -223,6 +403,8 @@ int main(int argc, char **argv) {
   /* Default settings */
   server_port = 8000;
   void (*request_handler)(int) = NULL;
+  wq_init(&work_queue);
+  num_threads = 1;
 
   int i;
   for (i = 1; i < argc; i++) {
